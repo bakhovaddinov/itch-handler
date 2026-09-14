@@ -1,0 +1,9 @@
+# Itch Handler
+
+Market Data Feed Handler (Nasdaq ITCH)
+
+Parse raw PCAP files of market data (like Nasdaq ITCH or FIX) to rebuild the real-time state of the market.
+
+The HFT signal: Tests your ability to handle raw network bytes over UDP or TCP with zero-copy parsing.
+
+C++ focus: Network I/O optimization, memory alignment, handling endianness, and strictly avoiding dynamic allocations on the hot path.
