@@ -2,8 +2,160 @@
 
 Market Data Feed Handler (Nasdaq ITCH)
 
-Parse raw PCAP files of market data (like Nasdaq ITCH or FIX) to rebuild the real-time state of the market.
+A single-pass, zero-copy parser for length-prefixed Nasdaq ITCH-style market
+data files. It memory-maps the input and walks the raw bytes to tally message
+statistics, with no dynamic allocations on the hot path.
 
-The HFT signal: Tests your ability to handle raw network bytes over UDP or TCP with zero-copy parsing.
+The HFT signal: how to handle raw network bytes over UDP or TCP with zero-copy
+parsing.
 
-C++ focus: Network I/O optimization, memory alignment, handling endianness, and strictly avoiding dynamic allocations on the hot path.
+C++ focus: network I/O optimization, memory alignment, endianness handling, and
+strictly avoiding dynamic allocations on the hot path.
+
+---
+
+## What it does
+
+Given a file of concatenated ITCH messages, the handler:
+
+1. `mmap`s the entire file read-only (`MAP_PRIVATE`) rather than copying it.
+2. Walks the buffer one record at a time, reading each 2-byte big-endian length
+   prefix to frame the next message.
+3. Counts messages by type and accumulates statistics for Add Order (`A`) and
+   Execute (`E`) messages.
+4. Prints a summary report with a throughput measurement (millions of
+   messages/sec).
+
+No heap allocation happens in the parse loop; the parser only reads mapped
+memory and mutates scalar counters.
+
+---
+
+## Project layout
+
+```
+.
+├── CMakeLists.txt     # build definition + HFT perf/strict-warning flags
+├── README
+└── src/
+    └── main.cpp       # the feed handler
+```
+
+---
+
+## Build
+
+Requires a C++20 compiler and CMake >= 3.15.
+
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+```
+
+This produces `build/feed_handler`, compiled with:
+
+- `-O3 -march=native` for maximum throughput on the host CPU.
+- `-Wall -Wextra -Wpedantic -Werror` so any warning is a hard failure.
+
+> `-march=native` targets the build machine's CPU. Rebuild on the machine you
+> intend to benchmark, or drop the flag for a portable binary.
+
+---
+
+## Usage
+
+```sh
+./build/feed_handler <file>
+```
+
+`<file>` is a binary file of concatenated, length-prefixed ITCH messages.
+
+Example:
+
+```sh
+./build/feed_handler data/itch.bin
+```
+
+### Output
+
+```
+--- Parsing Complete ---
+Total Messages: <N>
+Add Orders (A): <N>
+Execute Orders (E): <N>
+Total Shares:   <N>
+Time Elapsed:   <seconds> seconds
+Throughput:     <millions> million msgs/sec
+```
+
+- **Total Messages** — every framed record seen (any type, including unknown).
+- **Add Orders (A)** — count of `'A'` messages.
+- **Execute Orders (E)** — count of `'E'` messages.
+- **Total Shares** — sum of `shares` across all `'A'` messages.
+- **Time Elapsed** — wall time of the parse loop only (excludes `mmap`/reporting).
+- **Throughput** — `total_messages / elapsed_seconds`, in millions/sec.
+
+---
+
+## Wire format
+
+### Framing
+
+Every message is prefixed by a **2-byte unsigned big-endian length** giving the
+size of the payload that follows (the length does *not* include the prefix
+itself). All multi-byte integer fields inside messages are also big-endian
+(network byte order).
+
+### Add Order (`'A'`) — 36-byte payload
+
+The struct is declared `#pragma pack(1)` so there is no padding between fields,
+matching the byte layout on the wire exactly:
+
+| Offset | Field              | Size | Notes                          |
+|-------:|--------------------|-----:|--------------------------------|
+| 0      | `message_type`     | 1    | `'A'`                           |
+| 1      | `stock_locate`     | 2    | big-endian                      |
+| 3      | `tracking_number`  | 2    | big-endian                      |
+| 5      | `timestamp`        | 6    | 48-bit nanoseconds since midnight |
+| 11     | `order_ref_number` | 8    | big-endian                      |
+| 19     | `buy_sell_indicator` | 1  | `'B'` or `'S'`                  |
+| 20     | `shares`           | 4    | big-endian                      |
+| 24     | `stock`            | 8    | space-padded ticker             |
+| 32     | `price`            | 4    | big-endian fixed-point (1/10000)|
+
+The parser reads the byte-swapped `shares` field and adds it to the running
+`Total Shares` total.
+
+### Execute (`'E'`)
+
+Recognized and counted, but its fields are not otherwise parsed yet.
+
+### Everything else
+
+Any other message type is counted toward `Total Messages` and skipped (the
+parser advances by the declared length regardless).
+
+---
+
+## Design notes & performance
+
+- **Zero-copy**: the file is mapped, never read into a heap buffer. The parser
+  indexes directly into pages faulted in by the OS.
+- **No hot-path allocation**: only scalar counters are mutated inside the loop.
+- **Endianness**: `__builtin_bswap16` / `__builtin_bswap32` convert wire-order
+  values to host order for the length prefix and share counts.
+- **`mmap` outside the timer**: the throughput number reflects parse speed, not
+  I/O setup.
+- **`MAP_PRIVATE`**: copy-on-write mapping; the file is only read here.
+
+### Known limitations / good next steps
+
+- **Unaligned access**: the length prefix and `AddOrderMessage` are read via
+  `reinterpret_cast` from mapped memory. This is fine on x86 but is undefined
+  behavior (and can fault) on strict-alignment architectures. Reading into an
+  aligned local with `std::memcpy` is the portable fix.
+- **Truncated/corrupt input** currently `break`s out of the loop, producing a
+  partial but successful report; a strict mode could fail fast instead.
+- Only `'A'` and `'E'` are parsed; the full ITCH spec has many more types
+  (add/cancel/replace/delete, trade, system event, etc.).
+- No per-symbol aggregation or order-book reconstruction yet.
